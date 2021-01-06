@@ -4,8 +4,9 @@ import math
 import os
 import json
 
-from Lib.Utility import *
-from Model.Base_TFModel import Basement_TFModel
+# from Lib.Utility import *
+from Base_TFModel import Basement_TFModel
+
 
 class MultiDim_Analyzer(Basement_TFModel):
     
@@ -14,15 +15,18 @@ class MultiDim_Analyzer(Basement_TFModel):
         super(MultiDim_Analyzer, self).__init__(sess=sess, config=config, learning_rate=init_learning_rate,is_training=is_training)
         '''
         Model input Explanation & Reminder:
-        enc_input: the masked input of encoder, the dimension of time may varies with dec_input by [data generation and assignment in handler]
+        enc_input: the masked input of encoder, the dimension of time may varies with dec_input by [data generation and assignment in handler] 
+                   (batch_size, num_identity, period_enc, 1)
         dec_input: the masked input of encoder, the dimension of time may varies with enc_input by [data generation and assignment in handler]
+                   (batch_size, num_identity, period_dec, 1)
         truth_pred: used in loss calculation: have identical dimension with decoder input, same(shifted) value for completion(prediction)
         truth_mask: used in the calculation of metric like MSE and relabel the model output for comparison (Mask of Natural Loss)
         shared_info: auxiliary information for encoder/decoder input encoding for identity dimension. BTW, encoding in time dimension is similar to NLP
+                     (num_identity, num_shared_feature)
         scalar: the maximum value of each measurement, used for metric calculation
         
         For data in the value_sets (Data Unzip):
-        Size for model input/output: (batch_size, num_identity, num_measurement, period_enc/dec, 1)
+        Size for model input/output: (batch_size, num_identity, num_measurement->no?, period_enc/dec, 1)
         Size for auxiliary shared_info: (batch_size, num_shared_feature)
         '''
         (enc_input, ori_input, truth_pred, truth_mask, move_mask, shared_info, scalar) = value_sets
@@ -161,23 +165,24 @@ class MultiDim_Analyzer(Basement_TFModel):
                         KVtop_cache = {}
                 # Linear projection (unit expansion) for multihead-attention dimension: 
                 Q_iden = tf.layers.dense(tf.reshape(att_input,[batch,ids,-1]), self.num_heads*Iunits, 
-                                         use_bias=False, name='Q_ID')
+                                         use_bias=False, name='Q_ID')  # (N, L, --) -> (N, L, num_heads*Iunits)
                 K_iden = tf.layers.dense(tf.reshape(top_encod,[batch,ids,-1]), self.num_heads*Iunits, 
                                          use_bias=False, name='K_ID')
                 Q_time = tf.layers.dense(tf.reshape(tf.transpose(att_input,[0,2,1,3]),[batch,time,-1]), self.num_heads*Tunits, 
-                                         use_bias=False, name='Q_Time')
+                                         use_bias=False, name='Q_Time')  # (N, T, --) -> (N, T, num_heads*Iunits)
                 K_time = tf.layers.dense(tf.reshape(tf.transpose(top_encod,[0,2,1,3]),[batch,time,-1]), self.num_heads*Tunits, 
                                          use_bias=False, name='K_Time')
+                # same shape with inputs[batch, id, time, filters]
                 V = tf.layers.conv2d(inputs=top_encod, filters=V_filters, kernel_size=V_kernal, strides=V_stride, 
                                      padding="same", data_format="channels_last", name='V')
                 if KVtop_cache is not None:
-                    KVtop_cache = {'share_Kid':K_id, 'share_Ktime':K_time, 'share_V':V}
+                    KVtop_cache = {'share_Kid':K_iden, 'share_Ktime':K_time, 'share_V':V}
             else:
                 Q_iden = tf.layers.dense(tf.reshape(att_input,[batch,ids,-1]), self.num_heads*Iunits, 
                                          use_bias=False, name='Q_ID')
                 Q_time = tf.layers.dense(tf.reshape(tf.transpose(att_input,[0,2,1,3]),[batch,time,-1]), self.num_heads*Tunits, 
                                          use_bias=False, name='Q_Time')
-                K_id,K_time,V = cache['share_Kid'],cache['share_Ktime'],cache['share_V']
+                K_iden,K_time,V = cache['share_Kid'],cache['share_Ktime'],cache['share_V']
 
             # Split the matrix to multiple heads and then concatenate to build a larger batch size: 
             # [self.batch_size*self.num_heads, self.X, self.X]
@@ -197,7 +202,7 @@ class MultiDim_Analyzer(Basement_TFModel):
             
             out = self.softmax_combination(Q_headbatch, K_headbatch, V_headbatch, model_structure, att_unit, mask_recur)
 
-            # Merge the multi-head back to the original shape 
+            # Merge the multi-head back to the original shape
             # [batch_size, self.num_identity, self.num_measurement, self.length_time, 'hidden-units'*self.num_heads]
             out = tf.concat(tf.split(out, self.num_heads, axis=0), axis=3)  # 
             out = tf.layers.dense(out, 1, name='multihead_fuse')
@@ -250,8 +255,8 @@ class MultiDim_Analyzer(Basement_TFModel):
         assert K_I.get_shape().as_list()[0] == K_T.get_shape().as_list()[0]
 
         # Build the Attention Map
-        AM_Identity = tf.matmul(Q_I, tf.transpose(K_I, [0, 2, 1])) / tf.sqrt(tf.cast(Iunits, tf.float32))
-        AM_Time = tf.matmul(Q_T, tf.transpose(K_T, [0, 2, 1])) / tf.sqrt(tf.cast(Tunits, tf.float32))
+        AM_Identity = tf.matmul(Q_I, tf.transpose(K_I, [0, 2, 1])) / tf.sqrt(tf.cast(Iunits, tf.float32))  # (N, L, L)
+        AM_Time = tf.matmul(Q_T, tf.transpose(K_T, [0, 2, 1])) / tf.sqrt(tf.cast(Tunits, tf.float32))  # (N, T, T)
         if mask is not None:
             AM_Time = tf.multiply(AM_Time,mask) + tf.constant(-np.inf)*(tf.constant(1.0)-mask)
         if self.mask_imputation is not None:
@@ -338,6 +343,7 @@ class MultiDim_Analyzer(Basement_TFModel):
         self.flag_casuality = config.get('flag_casuality',False)
         self.flag_imputation = config.get('flag_imputation',False)
 
+    # positional encoding
     def auxiliary_encode(self,shared_info):
         # The concatenation is not applicable in this part since all the attention of all three dimension need to be learned.
         # Expanding each dimention will not make sense for our model.
@@ -346,17 +352,24 @@ class MultiDim_Analyzer(Basement_TFModel):
             shared_encoder = tf.layers.dense(tf.expand_dims(shared_info,0), self.period_enc, 
                                              use_bias=False, activation=None, name='encoder')
             shared_encoder = tf.reshape(shared_encoder, [1, self.num_identity, self.period_enc, 1])
+            # [batch_size, num_identity, period_dec, 1]
             shared_encoder = tf.tile(shared_encoder, [self.batch_size, 1, 1, 1])
+
             shared_decoder = tf.layers.dense(tf.expand_dims(shared_info,0), self.period_dec, 
                                              use_bias=False, activation=None, name='decoder')
             shared_decoder = tf.reshape(shared_decoder, [1, self.num_identity, self.period_dec, 1])
+            # [batch_size, num_identity, period_dec, 1]
             shared_decoder = tf.tile(shared_decoder, [self.batch_size, 1, 1, 1])
             
             denom = tf.constant(1000.0)
             phase_enc = tf.linspace(0.0,self.period_enc-1.0,self.period_enc)*tf.constant(math.pi/180.0)/denom
             phase_dec = tf.linspace(0.0,self.period_dec-1.0,self.period_dec)*tf.constant(math.pi/180.0)/denom
             sin_enc,sin_dec = tf.expand_dims(tf.sin(phase_enc),0),tf.expand_dims(tf.sin(phase_dec),0)
-            
+
             time_encoder = tf.expand_dims(tf.tile(tf.expand_dims(sin_enc,0),[self.batch_size,self.num_identity,1]),-1)
             time_decoder = tf.expand_dims(tf.tile(tf.expand_dims(sin_dec,0),[self.batch_size,self.num_identity,1]),-1)
             return (shared_encoder,shared_decoder,time_encoder,time_decoder)
+
+
+if __name__ == '__main__':
+    print('ok')
